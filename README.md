@@ -1,55 +1,66 @@
 # 🧠 Second Brain
-
-> A unified, multimodal AI memory assistant that transforms unstructured data into an intelligent, queryable knowledge system.
+> A unified, multimodal AI memory assistant that transforms unstructured data into an intelligent, queryable knowledge system — deployed and running on GCP.
 
 ---
 
 ## 📌 Abstract
 
-**Second Brain** is a personalized AI-powered knowledge system designed to ingest, process, and retrieve information from diverse data sources such as web pages, documents, and voice inputs.
-
-By leveraging **Retrieval-Augmented Generation (RAG)**, vector databases, and real-time transcription, the system enables users to interact with their stored knowledge through natural language queries—effectively acting as a long-term memory layer.
+**Second Brain** is a personalized AI-powered knowledge system designed to ingest, process, and retrieve information from diverse data sources — PDFs, Word documents, web pages, plain text, and voice recordings. By combining **Retrieval-Augmented Generation (RAG)**, persistent vector storage, real-time transcription, and an interactive neural map UI, the system lets you query your own knowledge base through natural language — effectively acting as a long-term AI memory layer.
 
 ---
 
-
 ## 🏗️ System Architecture
 
-![System Architecture Diagram](./assets/architecture.png)
-
-### 🔄 Pipeline Overview
-
 ```
-User Input (Text / Audio / URL / Docs)
+User Input (Text / Audio / URL / PDF / DOCX)
         ↓
-Data Ingestion Layer
+FastAPI Ingestion Layer  (api.py)
         ↓
-Processing & Cleaning
+Parsing & Cleaning
+  ├── pypdf       → PDF text extraction
+  ├── python-docx → DOCX paragraph extraction
+  ├── BeautifulSoup → URL scraping (strips nav/header/footer/scripts)
+  └── GCP Speech-to-Text → Audio transcription (WEBM_OPUS / LINEAR16)
         ↓
-Chunking & Embedding
+Priority Scoring  (ai-layer.py :: score_priority)
+  ├── Content signals  — urgency / task / medium keyword hits
+  ├── Source type boost — LOG/AUDIO +1 | WEB -1 | PDF/DOCX neutral
+  └── Recency boost    — <24h: +2 | <72h: +1 | older: 0
         ↓
-Vector Database (ChromaDB)
+Date Extraction  (extract_dates_from_text)
+  — Absolute, relative, quarter, month/year, last/next weekday, seasons
         ↓
-Retriever
+Chunking  (LlamaIndex TokenTextSplitter — 600 tokens, 60 overlap)
         ↓
-LLM (Groq - Llama 3)
+Embedding  (HuggingFace all-MiniLM-L6-v2)
         ↓
-Context-Aware Response
+ChromaDB  (PersistentClient — one collection per workspace)
+        ↓
+Query / Retrieval  (top-4 cosine similarity search)
+        ↓
+LLM Synthesis  (Groq SDK — Llama 3.3 70B Versatile, temp 0.2)
+        ↓
+Context-Aware Response  →  Frontend (second-brain.html)
 ```
 
 ---
 
 ## ⚙️ Tech Stack
 
-| Layer          | Technology                        |
-| -------------- | --------------------------------- |
-| Backend        | Python                            |
-| LLM            | Groq (Llama 3)                    |
-| Embeddings     | HuggingFace (MiniLM)              |
-| Vector DB      | ChromaDB                          |
-| Framework      | LlamaIndex                        |
-| Speech-to-Text | Google Cloud Speech API           |
-| Parsing        | BeautifulSoup, PyPDF, python-docx |
+| Layer | Technology |
+|---|---|
+| Backend framework | FastAPI + Uvicorn |
+| LLM | Groq — `llama-3.3-70b-versatile` |
+| Embeddings | HuggingFace `all-MiniLM-L6-v2` |
+| Vector DB | ChromaDB (PersistentClient) |
+| RAG framework | LlamaIndex (VectorStoreIndex, TokenTextSplitter) |
+| Speech-to-Text | Google Cloud Speech-to-Text API |
+| PDF parsing | pypdf |
+| DOCX parsing | python-docx |
+| Web scraping | BeautifulSoup4 + requests |
+| Date parsing | python-dateutil |
+| Frontend | Vanilla JS + Canvas API (single HTML file, PWA) |
+| Deployment | GCP VM |
 
 ---
 
@@ -57,42 +68,74 @@ Context-Aware Response
 
 ### 🧩 Multi-Modal Data Ingestion
 
-* 🌐 Web scraping (BeautifulSoup)
-* 📄 PDF parsing (PyPDF)
-* 📝 DOCX extraction
-* 🎙️ Audio transcription (GCP Speech-to-Text)
+Five ingestion routes, all feeding the same ChromaDB pipeline:
+
+| Method | Endpoint | What it accepts |
+|---|---|---|
+| File upload | `POST /api/upload` | PDF, DOCX, TXT, MD, CSV |
+| Raw text | `POST /api/index` | Pre-extracted text + source metadata |
+| URL scrape | `POST /api/ingest-url` | Any public webpage |
+| Audio | `POST /api/ingest-audio` | MP3, WAV, OGG, WEBM (microphone recordings) |
+| Chat log | Auto | Every conversation turn is re-indexed as a LOG node |
 
 ---
 
-### 🧠 Intelligent Memory Layer
+### 🧠 Priority Scoring System
 
-* Semantic chunking with token overlap
-* Dense vector embeddings
-* Persistent storage using ChromaDB
+Every ingested document is automatically scored on a 3-tier priority system and displayed as a **colour-coded ring** around its graph node.
+
+| Priority | Ring colour | Criteria |
+|---|---|---|
+| 1 — HIGH | 🔴 Red | Urgency keywords (`urgent`, `deadline`, `asap`, etc.) **or** raw score ≥ 5 |
+| 2 — MEDIUM | 🟡 Yellow | Task/action keywords (`meeting`, `todo`, `follow-up`, etc.) **or** raw score ≥ 2 |
+| 3 — LOW | 🟢 Green | Reference material — no urgency/task signals, old docs, web articles |
+
+Priority is also **dynamic**: every 5 queries on a node boosts its score by 1 point, allowing frequently accessed reference docs to climb to MEDIUM or HIGH over time.
 
 ---
 
 ### 🔍 Contextual Retrieval (RAG)
 
-* Top-K similarity search
-* Workspace-based isolation (multi-tenant design)
-* Context grounding for accurate responses
+- Top-4 similarity search against the workspace's ChromaDB collection
+- Query embedded with the same `all-MiniLM-L6-v2` model used at index time
+- Retrieved chunks injected directly into the Groq system prompt
+- Strict grounding: model responds with *"I could not find that in your indexed documents"* if the answer isn't in context
+
+---
+
+### 🕸️ Neural Knowledge Graph
+
+The frontend renders an animated canvas-based graph where:
+
+- **YOU** core node is the workspace anchor
+- Each ingested document appears as an orbiting node labeled by file type (PDF, DOCX, NOTE, LOG, AUDIO, WEB)
+- **Priority ring** (thin 1px line with gap) shows urgency at a glance — red / yellow / green
+- **Semantic edges** drawn between nodes with cosine similarity ≥ 0.72 (computed live via `/api/connections`)
+- Nodes drift with physics simulation (repulsion + gentle damping), zoom-to-fit on load
+- Click any node to inspect metadata; right-click to delete
+
+---
+
+### 📅 Timeline & Calendar
+
+- `POST /api/timeline` — synthesizes a chronological markdown timeline from all date references extracted across your documents
+- `GET /api/calendar/{workspace_id}` — returns a monthly calendar view showing which dates have indexed content
+- Supports date-range filtering: `from 2025-01-01 to 2025-12-31`
+- Ask the chat interface directly: *"show timeline"* / *"generate timeline"*
 
 ---
 
 ### 💬 Conversational AI Interface
 
-* Dynamic prompt engineering
-* Context-aware responses using Groq LLM
-* Chat engine with memory tracking
+- `POST /api/chat` — workspace-scoped, RAG-grounded responses via Groq
+- Timeline queries auto-detected and routed to `generate_timeline()` before hitting the LLM
+- Every exchange persisted to a per-workspace `.jsonl` chat log and re-indexed as a LOG node so past conversations are queryable
 
 ---
 
-### 🧪 Testing Pipeline
+### 📦 PWA Support
 
-* End-to-end ingestion validation
-* Audio + text indexing
-* Retrieval + response synthesis
+`second-brain.html` ships with a manifest and service worker for full Progressive Web App install — network-first fetch strategy, offline shell fallback, API calls bypass cache entirely.
 
 ---
 
@@ -102,44 +145,41 @@ Context-Aware Response
 Second-Brain/
 │
 ├── ai-layer/
-│   ├── ai-layer.py
-│   ├── .env.example
+│   ├── ai-layer.py          # Core AI engine: parsers, embeddings, RAG, priority scoring
+│   ├── api.py               # FastAPI server — all HTTP endpoints
+│   ├── gcp_key.json         # GCP service account key (not committed)
+│   ├── .env                 # API keys and config (not committed)
+│   ├── .env.example         # Template
+│   └── chat_logs/           # Per-workspace .jsonl conversation logs
 │
-├── chroma_db/              # Persistent vector storage
-├── assets/                 # Images (architecture, UI, etc.)
-│   ├── architecture.png
+├── chroma_db/               # Persistent ChromaDB vector storage
 │
-├── README.md
-└── requirements.txt
+├── second-brain.html        # Frontend — single-file PWA (canvas graph + chat + ingestion)
+├── manifest.json            # PWA manifest
+├── service-worker.js        # PWA service worker
+│
+├── assets/
+│   └── architecture.png
+│
+├── requirements.txt
+└── README.md
 ```
-
----
-
-## 🖼️ Demo & Screenshots
-
-### 🔹 Architecture
-
-![Architecture](./assets/architecture.png)
-
-### 🔹 Chat Interface (Placeholder)
-
-![Chat UI](./assets/chat-ui.png)
-
-### 🔹 Data Ingestion Flow (Placeholder)
-
-![Ingestion](./assets/ingestion.png)
 
 ---
 
 ## 🔐 Environment Setup
 
-Create a `.env` file:
+Create a `.env` file in `ai-layer/`:
 
-```
+```env
 GROQ_API_KEY=your_groq_api_key
-GOOGLE_APPLICATION_CREDENTIALS=path_to_gcp_key.json
+GOOGLE_APPLICATION_CREDENTIALS=./gcp_key.json
 DATABASE_PATH=./chroma_db
+HOST=0.0.0.0
+PORT=8000
 ```
+
+Place your GCP service account JSON key at `ai-layer/gcp_key.json`. The path is resolved relative to `ai-layer.py` regardless of working directory.
 
 ---
 
@@ -147,8 +187,7 @@ DATABASE_PATH=./chroma_db
 
 ```bash
 git clone https://github.com/your-username/Second-Brain.git
-cd Second-Brain
-
+cd Second-Brain/ai-layer
 pip install -r requirements.txt
 ```
 
@@ -157,42 +196,74 @@ pip install -r requirements.txt
 ## ▶️ Running the Project
 
 ```bash
-python ai-layer/ai-layer.py
+cd ai-layer
+python api.py
 ```
 
 Then open:
-
-```text
+```
 http://127.0.0.1:8000
 ```
 
-The Python backend serves `second-brain.html` and exposes the frontend API:
-
-```text
-GET  /api/health
-POST /api/chat
-POST /api/ingest/files
-POST /api/ingest/text
-POST /api/ingest/url
+Swagger UI (auto-generated API docs):
+```
+http://127.0.0.1:8000/docs
 ```
 
 ---
 
-## 🧪 Running Tests
+## 🌐 API Reference
 
-```bash
-python test_pipeline.py
-```
+### Ingestion
+
+| Method | Endpoint | Body / Params | Description |
+|---|---|---|---|
+| `POST` | `/api/upload` | `form: workspace_id, file` | Upload PDF / DOCX / TXT |
+| `POST` | `/api/index` | `{workspace_id, text, source_id, source_type}` | Index pre-extracted text |
+| `POST` | `/api/ingest-url` | `{workspace_id, url}` | Scrape and index a URL |
+| `POST` | `/api/ingest-audio` | `form: workspace_id, file` | Transcribe audio and index |
+
+### Query & Chat
+
+| Method | Endpoint | Body / Params | Description |
+|---|---|---|---|
+| `POST` | `/api/chat` | `{workspace_id, message, app_identity?, custom_rules?}` | RAG-grounded chat |
+| `POST` | `/api/timeline` | `{workspace_id, start_date?, end_date?}` | Generate markdown timeline |
+| `GET` | `/api/calendar/{workspace_id}` | `?month=&year=` | Monthly calendar of indexed dates |
+
+### Graph & Nodes
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/nodes/{workspace_id}` | List all nodes with priority + query count |
+| `GET` | `/api/connections/{workspace_id}` | Pairwise cosine similarity edges (threshold 0.60) |
+| `POST` | `/api/nodes/{workspace_id}/increment` | Increment query count for a node |
+| `GET` | `/api/chatlog/{workspace_id}` | Retrieve last N chat log entries |
+
+### Management
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `DELETE` | `/api/node/{workspace_id}?source_id=` | Delete a single node (or clear chat log) |
+| `DELETE` | `/api/workspace/{workspace_id}` | Nuke entire workspace + ChromaDB collection |
+| `GET` | `/api/health` | Service health check |
+| `GET` | `/api/info` | API version and endpoint listing |
 
 ---
 
 ## 📈 Future Enhancements
 
-* 🔊 Text-to-Speech (Full voice assistant loop)
-* 🌐 Frontend UI (React / Flutter)
-* ☁️ GCP Deployment (Cloud Run / App Engine)
-* 🧾 Source citations in responses
-* 🧠 Memory summarization & compression
+- 🔊 Text-to-Speech — close the full voice loop (speak queries, hear responses)
+- 🧾 Source citations — surface which document chunks grounded each response
+- 🧠 Memory summarization — compress old chat logs into condensed embeddings
+- 🔒 Auth layer — multi-user workspace isolation
+- ☁️ Cloud Run deployment — containerized, autoscaled GCP hosting
+- 🔗 Browser extension — ingest pages directly from Chrome
 
 ---
 
+## 👥 Team
+
+Built by **Mizin Sadikh**, **Diya**, **Achsa**, and **Vargeese**
+Guided by **Basil Scaria**
+Muthoot Institute of Technology and Science, Kochi
